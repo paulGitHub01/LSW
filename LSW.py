@@ -278,7 +278,7 @@ def material_has_sqw_calculation(material: Material, config: Config) -> bool:
             f"Loaded S(q,w) k-shape {material.sqw_2_ad_a_equiv_class.shape[2:5]} does not match expected {k_shape}, recalculating S(q,w) stage."
         )
         return False
-    if config.calc_two_magnon_spectra and material.conv_sqw_2_ad_a_equiv_classes.shape[2] != 2 * config.amount_w_values:
+    if config.calc_two_magnon_spectra and material.conv_sqw_2_ad_a_equiv_classes.shape[2] < 2 * config.amount_w_values:
         warn_if_loaded(
             f"Loaded two-magnon S(q,w) energy grid has {material.conv_sqw_2_ad_a_equiv_classes.shape[2]} points, expected {2 * config.amount_w_values}; recalculating S(q,w) stage."
         )
@@ -1361,7 +1361,7 @@ def sqw_prime_from_a_ad_to_xyz(
         a_op.append(sp.symbols("a" + str(i), commutative=False))
         ad_op.append(Dagger(a_op[i]))
         Sop_i.append(
-            np.sqrt(S) / 2 * (ub * a_op[i] + u * ad_op[i])
+            np.sqrt(S / 2) * (ub * a_op[i] + u * ad_op[i])
             + v * (S - ad_op[i] * a_op[i])
         )
         Sop_i[-1] = np.concatenate(
@@ -1698,11 +1698,14 @@ def calc_H_T_w_on_grid(
         )
         # the energy window is decided on
         if q_shift_index == 0:
-            w_values = np.linspace(
-                np.min(H_diag) - 0.2,
-                np.max(H_diag) + 10 * config.Gamma,
-                config.amount_w_values,
-            )
+            # equidistant grid w_j = (m + j) dw with an integer m, so that the
+            # convolution grid of the two-magnon part (bin n at 2 w_0 + n dw) is the
+            # same grid shifted by m bins; it covers at least
+            # [E_min - 0.2, E_max + 10 Gamma]
+            w_bottom = np.min(np.real(H_diag)) - 0.2
+            w_top = np.max(np.real(H_diag)) + 10 * config.Gamma
+            dw = (w_top - w_bottom) / (config.amount_w_values - 2)
+            w_values = (np.floor(w_bottom / dw) + np.arange(config.amount_w_values)) * dw
 
         config.debug_timer.print_difference(
             "calculated H and bog_trafo ", config.debug_timing
@@ -1803,7 +1806,7 @@ def give_phase_factor_from_total_k(
 
             exp_minus_i_rj_q = material.e_minus_ikd(pos_j, q_values)
             prefactor = (
-                np.sqrt(np.abs(si * s_j)) * np.conj(exp_minus_i_ri_q) * exp_minus_i_rj_q
+                np.conj(exp_minus_i_ri_q) * exp_minus_i_rj_q
             )
             prefactor_tensor[..., i, j] = prefactor
             prefactor_tensor[..., i + N, j] = prefactor
@@ -2060,7 +2063,7 @@ def calculate_sqw_spectra(
         residues_2_prime_ad_a_w = einsum_RAM.contract_autostore(
         "tcd...l,l->tcd...",
         residues_2_prime_ad_a_w,
-        extraction_only_creation_operator,
+        extraction_only_creation_operator / extraction_only_creation_operator.shape[0],  # the same 1/(2N) as in the branch below
         optimize="optimal",
         config=config
     )
@@ -2162,7 +2165,7 @@ def calculate_sqw_spectra(
         #TODO: shouldnt be necessary anymore (for config always 1)
         norm = (
             (np.max(w_values) - np.min(w_values))
-            / (config.amount_w_values)
+            / (config.amount_w_values - 1)
             * 1
             / config.number_k_points
             if config.use_intensity_normalisation
@@ -2174,9 +2177,28 @@ def calculate_sqw_spectra(
                 if config.use_intensity_normalisation
                 else 1
             )  # only 1/Nk
-        material.conv_sqw_2_ad_a_equiv_classes = norm * np.array(
+        # each one-magnon grid carries the factor 1/(2N) of the mode sum, so the
+        # convolution carries it twice; multiply by 2N to give S4 the same single
+        # 1/(2N) as S2 (Wick: S4 = 1/N_k sum_k R(k) R(q-k) with the raw residues R)
+        norm = norm * 2 * material.N
+        convoluted_grids_equivalence_classes = norm * np.array(
             convoluted_grids_equivalence_classes
         )
+        # convolution bin n lies at 2 w_0 + n dw = w_0 + (n + m) dw with w_0 = m dw;
+        # shift by m bins so that the two-magnon grids use the energies w_0 + n dw
+        # of the one-magnon grid (extended); m > 0 (gap) needs m extra bins on top
+        dw = np.real(w_values[1] - w_values[0])
+        m = int(np.rint(np.real(w_values[0]) / dw))
+        W2 = convoluted_grids_equivalence_classes.shape[2]
+        shifted = np.zeros(
+            convoluted_grids_equivalence_classes.shape[:2] + (W2 + max(m, 0),) + convoluted_grids_equivalence_classes.shape[3:],
+            dtype=convoluted_grids_equivalence_classes.dtype,
+        )
+        if m >= 0:
+            shifted[:, :, m:] = convoluted_grids_equivalence_classes
+        else:
+            shifted[:, :, : W2 + m] = convoluted_grids_equivalence_classes[:, :, -m:]
+        material.conv_sqw_2_ad_a_equiv_classes = shifted
 
         coeff_sym_classes_tioju_4 = np.zeros(
             (
@@ -2300,7 +2322,7 @@ def calculate_complete_RIXS_spectrum_for_sqw_xyz_experimental_setup(
     debug_RIXS=False,
    
     hbar=6.582e-16,  # hbar in eV*s
-    c=2.992792e8,  # c in m/s
+    c=2.99792458e8,  # c in m/s
     ):
     """Compute the total RIXS cross section for the given material and experimental setup and saves it to material
     
@@ -2955,7 +2977,7 @@ def define_experimental_setup(config, alpha=None, two_theta=None, phi=None, draw
         # sigma-polarised input
         if polarisation_in_sigma:
             epsilon_in[p] = np.array(
-                [np.sin(phi), -np.cos(phi), np.zeros_like(beta)], dtype=float
+                [np.cos(phi), -np.sin(phi), np.zeros_like(beta)], dtype=float
             )
         # pi-polarised input
         else:
@@ -2971,7 +2993,7 @@ def define_experimental_setup(config, alpha=None, two_theta=None, phi=None, draw
         # sigma-polarised output
         if polarisation_out_sigma:
             epsilon_out[p] = np.array(
-                [np.sin(phi), -np.cos(phi), np.zeros_like(beta)], dtype=float
+                [np.cos(phi), -np.sin(phi), np.zeros_like(beta)], dtype=float
             )
         # pi-polarised output
         else:
@@ -3379,7 +3401,7 @@ def plotting_rixs_spectra(material: Material, config: Config,
         
         if draw_cryst_vectors:
             fig, ax = functions.plot_vectors_3d(
-                functions.give_reciprocal_lv(material.crystallographic_lv) / k_unit_scale,
+                np.array(functions.give_reciprocal_lv(material.crystallographic_lv)) / k_unit_scale,
                 colors=["orange"] * 3,
                 labels=[""] * 3,
                 axis_labels=axis_labels_pi_over_a,
@@ -3408,12 +3430,12 @@ def plotting_rixs_spectra(material: Material, config: Config,
             )
         if draw_BZ:
             functions.plot_BZ_from_lv(
-                ax, material.get_reciprocal_lattice_vectors() / k_unit_scale, include_negative=True
+                ax, np.array(material.get_reciprocal_lattice_vectors()) / k_unit_scale, include_negative=True
             )
         
         if draw_lv:
             fig, ax = functions.plot_vectors_3d(
-                material.get_reciprocal_lattice_vectors() / k_unit_scale, labels=[""] * 3,
+                np.array(material.get_reciprocal_lattice_vectors()) / k_unit_scale, labels=[""] * 3,
                 ax=ax,
                 fig=fig,
                 axis_labels=axis_labels_pi_over_a,
